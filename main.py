@@ -1,6 +1,8 @@
 """
-TELEGRAM FILE STORE BOT - Single File Production Ready
-Optimized for Render Free Plan (Low RAM, Long Polling)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💎 ULTIMATE TELEGRAM FILE STORE BOT (Render Optimized)
+🔥 Single File | SQLite | Private Storage | Long Polling
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import os
@@ -10,41 +12,36 @@ import logging
 import sqlite3
 import threading
 import secrets
-import json
+import socket
 from datetime import datetime
 from functools import wraps
-from typing import Optional, List, Union
+from typing import Optional
 
 import telebot
-from telebot import types, apihelper
+from telebot import types
 
-# ---------------------------------------------------------
-# CONFIGURATION & ENV VARS
-# ---------------------------------------------------------
-# Required Environment Variables:
-# BOT_TOKEN: Your Telegram Bot Token
-# OWNER_ID: Your Telegram User ID
-# BIN_CHANNEL: ID of the private channel for main storage (e.g. -100xxxx)
-# LOG_CHANNEL: ID of the private channel for logs (e.g. -100xxxx)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ⚙️ CONFIGURATION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-OWNER_ID = int(os.environ.get('OWNER_ID', 0))
-BIN_CHANNEL = int(os.environ.get('BIN_CHANNEL', 0))
-LOG_CHANNEL = int(os.environ.get('LOG_CHANNEL', 0))
+OWNER_ID = int(os.environ.get('OWNER_ID', '0'))
+BIN_CHANNEL = int(os.environ.get('BIN_CHANNEL', '0'))  # Storage Channel
+LOG_CHANNEL = int(os.environ.get('LOG_CHANNEL', '0'))  # Log Channel
 
-# Optional Config
+# DB Config
 DB_NAME = "bot_data.db"
-ADMIN_LIST = [OWNER_ID]  # Add other admin IDs here if hardcoded
-BROADCAST_CHUNK_SIZE = 50  # Process 50 users at a time to save RAM
+ADMIN_LIST = [OWNER_ID] 
 
 # Initialize Bot
-bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=3) # Low threads for low RAM
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 logger = telebot.logger
 telebot.logger.setLevel(logging.INFO)
 
-# ---------------------------------------------------------
-# DATABASE MANAGER (SQLite)
-# ---------------------------------------------------------
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🗄️ DATABASE ENGINE (SQLite)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 class Database:
     def __init__(self, db_file):
         self.db_file = db_file
@@ -57,7 +54,7 @@ class Database:
         conn = self.get_connection()
         c = conn.cursor()
         
-        # Users Table
+        # Users
         c.execute('''CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             role TEXT DEFAULT 'user',
@@ -65,7 +62,7 @@ class Database:
             joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
         
-        # Files Table
+        # Files
         c.execute('''CREATE TABLE IF NOT EXISTS files (
             file_code TEXT PRIMARY KEY,
             file_name TEXT,
@@ -80,428 +77,467 @@ class Database:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
 
-        # User Channels Table
+        # Channels mapping
         c.execute('''CREATE TABLE IF NOT EXISTS channels (
             user_id INTEGER PRIMARY KEY,
             channel_id INTEGER,
             channel_title TEXT
         )''')
 
-        # Indexes for speed
-        c.execute('CREATE INDEX IF NOT EXISTS idx_files_uploader ON files(uploader_id)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_files_unique ON files(file_unique_id)')
-        
+        # Settings (Key-Value)
+        c.execute('''CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )''')
+
         conn.commit()
         conn.close()
 
-    # --- User Methods ---
+    # --- SETTINGS ---
+    def get_setting(self, key, default="0"):
+        conn = self.get_connection()
+        res = conn.execute('SELECT value FROM settings WHERE key = ?', (key,)).fetchone()
+        conn.close()
+        return res[0] if res else default
+
+    def set_setting(self, key, value):
+        conn = self.get_connection()
+        conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, str(value)))
+        conn.commit()
+        conn.close()
+
+    # --- USERS ---
     def add_user(self, user_id):
         conn = self.get_connection()
-        c = conn.cursor()
-        try:
-            c.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
-            conn.commit()
-        finally:
-            conn.close()
+        conn.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
+        conn.commit()
+        conn.close()
 
-    def get_user_role(self, user_id):
+    def get_user_status(self, user_id):
         conn = self.get_connection()
-        c = conn.cursor()
-        res = c.execute('SELECT role, banned FROM users WHERE user_id = ?', (user_id,)).fetchone()
+        res = conn.execute('SELECT role, banned FROM users WHERE user_id = ?', (user_id,)).fetchone()
         conn.close()
         return res if res else ('user', 0)
 
-    def set_ban_status(self, user_id, status: int):
+    def set_ban(self, user_id, is_banned):
         conn = self.get_connection()
-        conn.execute('UPDATE users SET banned = ? WHERE user_id = ?', (status, user_id))
+        conn.execute('UPDATE users SET banned = ? WHERE user_id = ?', (1 if is_banned else 0, user_id))
         conn.commit()
         conn.close()
 
-    # --- File Methods ---
-    def add_file(self, file_code, file_name, mime_type, file_id, unique_id, msg_id, chan_id, uploader_id):
+    def get_all_users(self):
+        """Yields users for broadcast to save RAM"""
         conn = self.get_connection()
-        try:
-            conn.execute('''INSERT INTO files 
-                (file_code, file_name, mime_type, file_id, file_unique_id, message_id, channel_id, uploader_id) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                (file_code, file_name, mime_type, file_id, unique_id, msg_id, chan_id, uploader_id))
-            conn.commit()
-        finally:
-            conn.close()
-
-    def get_file(self, file_code):
-        conn = self.get_connection()
-        c = conn.cursor()
-        res = c.execute('SELECT * FROM files WHERE file_code = ?', (file_code,)).fetchone()
-        conn.close()
-        return res
-
-    def delete_file(self, file_code):
-        conn = self.get_connection()
-        conn.execute('DELETE FROM files WHERE file_code = ?', (file_code,))
-        conn.commit()
-        conn.close()
-
-    def increment_download(self, file_code):
-        conn = self.get_connection()
-        conn.execute('UPDATE files SET downloads = downloads + 1 WHERE file_code = ?', (file_code,))
-        conn.commit()
-        conn.close()
-
-    def get_user_files(self, user_id, limit=10, offset=0):
-        conn = self.get_connection()
-        c = conn.cursor()
-        res = c.execute('SELECT file_code, file_name, downloads FROM files WHERE uploader_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?', 
-                        (user_id, limit, offset)).fetchall()
-        conn.close()
-        return res
-
-    # --- Stats & System ---
-    def get_stats(self):
-        conn = self.get_connection()
-        c = conn.cursor()
-        total_users = c.execute('SELECT COUNT(*) FROM users').fetchone()[0]
-        total_files = c.execute('SELECT COUNT(*) FROM files').fetchone()[0]
-        total_banned = c.execute('SELECT COUNT(*) FROM users WHERE banned = 1').fetchone()[0]
-        conn.close()
-        return total_users, total_files, total_banned
-
-    def get_all_users_generator(self):
-        """Generator to fetch users in chunks for memory efficiency"""
-        conn = self.get_connection()
-        c = conn.cursor()
-        c.execute('SELECT user_id FROM users')
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id FROM users')
         while True:
-            batch = c.fetchmany(BROADCAST_CHUNK_SIZE)
-            if not batch:
-                break
-            for row in batch:
-                yield row[0]
+            rows = cursor.fetchmany(100)
+            if not rows: break
+            for row in rows: yield row[0]
+        conn.close()
+
+    # --- FILES ---
+    def add_file(self, code, name, mime, fid, uid, mid, cid, uploader):
+        conn = self.get_connection()
+        conn.execute('''INSERT INTO files (file_code, file_name, mime_type, file_id, file_unique_id, 
+                        message_id, channel_id, uploader_id) VALUES (?,?,?,?,?,?,?,?)''',
+                        (code, name, mime, fid, uid, mid, cid, uploader))
+        conn.commit()
+        conn.close()
+
+    def get_file(self, code):
+        conn = self.get_connection()
+        res = conn.execute('SELECT * FROM files WHERE file_code = ?', (code,)).fetchone()
+        conn.close()
+        return res
+
+    def delete_file(self, code):
+        conn = self.get_connection()
+        conn.execute('DELETE FROM files WHERE file_code = ?', (code,))
+        conn.commit()
+        conn.close()
+
+    def add_download(self, code):
+        conn = self.get_connection()
+        conn.execute('UPDATE files SET downloads = downloads + 1 WHERE file_code = ?', (code,))
+        conn.commit()
+        conn.close()
+
+    def get_user_files_stats(self, user_id):
+        conn = self.get_connection()
+        count = conn.execute('SELECT COUNT(*) FROM files WHERE uploader_id = ?', (user_id,)).fetchone()[0]
+        conn.close()
+        return count
+
+    # --- STATS ---
+    def get_system_stats(self):
+        conn = self.get_connection()
+        users = conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+        files = conn.execute('SELECT COUNT(*) FROM files').fetchone()[0]
+        banned = conn.execute('SELECT COUNT(*) FROM users WHERE banned = 1').fetchone()[0]
+        conn.close()
+        return users, files, banned
+    
+    # --- CHANNELS ---
+    def set_channel(self, uid, cid, title):
+        conn = self.get_connection()
+        conn.execute('INSERT OR REPLACE INTO channels VALUES (?,?,?)', (uid, cid, title))
+        conn.commit()
         conn.close()
     
-    # --- Channel Mapping ---
-    def set_user_channel(self, user_id, channel_id, title):
+    def get_channel(self, uid):
         conn = self.get_connection()
-        conn.execute('INSERT OR REPLACE INTO channels (user_id, channel_id, channel_title) VALUES (?, ?, ?)',
-                     (user_id, channel_id, title))
-        conn.commit()
-        conn.close()
-
-    def get_user_channel(self, user_id):
-        conn = self.get_connection()
-        res = conn.execute('SELECT channel_id FROM channels WHERE user_id = ?', (user_id,)).fetchone()
+        res = conn.execute('SELECT channel_id FROM channels WHERE user_id = ?', (uid,)).fetchone()
         conn.close()
         return res[0] if res else None
 
-# Initialize DB
 db = Database(DB_NAME)
 
-# ---------------------------------------------------------
-# HELPERS & DECORATORS
-# ---------------------------------------------------------
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🛠️ UTILS & DECORATORS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def get_file_type_and_id(message):
-    """Extract file info from any message type."""
-    if message.document:
-        return 'doc', message.document.file_id, message.document.file_unique_id, message.document.file_name, message.document.mime_type
-    elif message.video:
-        return 'video', message.video.file_id, message.video.file_unique_id, message.video.file_name or "video.mp4", message.video.mime_type
-    elif message.audio:
-        return 'audio', message.audio.file_id, message.audio.file_unique_id, message.audio.file_name or "audio.mp3", message.audio.mime_type
-    elif message.photo:
-        # Photos are lists, get the largest
-        p = message.photo[-1]
-        return 'photo', p.file_id, p.file_unique_id, "photo.jpg", "image/jpeg"
-    return None, None, None, None, None
-
-def generate_safe_code():
-    return secrets.token_urlsafe(8)
-
-def log_event(text):
-    """Logs to the private log channel."""
-    if LOG_CHANNEL:
-        try:
-            bot.send_message(LOG_CHANNEL, f"📝 **LOG**: {text}", parse_mode="Markdown")
-        except Exception as e:
-            print(f"Logging Error: {e}")
-
-# Decorators
-def is_banned(func):
-    @wraps(func)
-    def wrapper(message, *args, **kwargs):
-        user_id = message.from_user.id
-        role, banned = db.get_user_role(user_id)
-        if banned:
-            return
-        return func(message, *args, **kwargs)
-    return wrapper
+def generate_code(): return secrets.token_urlsafe(6)
 
 def is_admin(func):
     @wraps(func)
     def wrapper(message, *args, **kwargs):
-        user_id = message.from_user.id
-        if user_id not in ADMIN_LIST and user_id != OWNER_ID:
+        if message.from_user.id not in ADMIN_LIST and message.from_user.id != OWNER_ID:
             return
         return func(message, *args, **kwargs)
     return wrapper
 
-# ---------------------------------------------------------
-# BOT HANDLERS
-# ---------------------------------------------------------
+def check_user(func):
+    @wraps(func)
+    def wrapper(message, *args, **kwargs):
+        uid = message.from_user.id
+        role, banned = db.get_user_status(uid)
+        if banned: return
+        
+        # Check Maintenance Mode (Admins bypass)
+        m_mode = db.get_setting("maintenance_mode") == "1"
+        if m_mode and uid not in ADMIN_LIST and uid != OWNER_ID:
+            bot.reply_to(message, "⚠️ **System is under maintenance.**\nPlease try again later.")
+            return
+            
+        return func(message, *args, **kwargs)
+    return wrapper
+
+def log(text):
+    if LOG_CHANNEL:
+        try: bot.send_message(LOG_CHANNEL, f"📝 `{text}`")
+        except: pass
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🎮 MENUS & UI (INLINE KEYBOARDS)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def main_menu_keyboard(user_id):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("📂 My Files", callback_data="my_files"),
+        types.InlineKeyboardButton("⚙️ Settings", callback_data="user_settings"),
+        types.InlineKeyboardButton("🆘 Help & Commands", callback_data="help_menu")
+    )
+    if user_id in ADMIN_LIST or user_id == OWNER_ID:
+        kb.add(types.InlineKeyboardButton("🛡️ Admin Panel", callback_data="admin_panel"))
+    return kb
+
+def admin_keyboard():
+    m_mode = db.get_setting("maintenance_mode") == "1"
+    status_icon = "🔴" if m_mode else "🟢"
+    
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("📊 Statistics", callback_data="adm_stats"),
+        types.InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast"),
+        types.InlineKeyboardButton("🚫 Ban User", callback_data="adm_ban"),
+        types.InlineKeyboardButton("🔓 Unban User", callback_data="adm_unban"),
+        types.InlineKeyboardButton("🗑 Delete File", callback_data="adm_del"),
+        types.InlineKeyboardButton(f"Maintenance: {status_icon}", callback_data="adm_maint_toggle")
+    )
+    kb.add(types.InlineKeyboardButton("🔙 Back to Home", callback_data="home"))
+    return kb
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 📥 COMMAND HANDLERS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @bot.message_handler(commands=['start'])
-@is_banned
-def start_handler(message):
+@check_user
+def start_command(message):
     db.add_user(message.from_user.id)
     args = message.text.split()
     
-    # Deep Linking Logic
+    # ➤ DEEP LINK HANDLING
     if len(args) > 1:
-        file_code = args[1]
-        file_data = db.get_file(file_code)
+        code = args[1]
+        file_data = db.get_file(code)
         
         if not file_data:
-            bot.reply_to(message, "⚠️ File not found or deleted.")
+            bot.reply_to(message, "❌ **File Not Found**\nIt may have been deleted.")
             return
 
-        # file_data: (0:code, 1:name, 2:mime, 3:fid, 4:uid, 5:mid, 6:cid, 7:uid, 8:dl, 9:vis, 10:time)
+        # (code, name, mime, fid, uid, msg_id, chan_id, uploader, dl, vis, time)
         channel_id = file_data[6]
-        message_id = file_data[5]
-        file_name = file_data[1]
-
+        msg_id = file_data[5]
+        name = file_data[1]
+        
         try:
-            # Use copy_message to avoid forwarding tag and protect original sender
-            bot.copy_message(
-                chat_id=message.chat.id,
-                from_chat_id=channel_id,
-                message_id=message_id,
-                caption=f"📄 **{file_name}**\n\n🤖 via @{bot.get_me().username}",
-                parse_mode="Markdown"
-            )
-            db.increment_download(file_code)
-            log_event(f"User {message.from_user.id} accessed file {file_code}")
-        except Exception as e:
-            bot.reply_to(message, "⚠️ Error retrieving file. It might have been deleted from storage.")
-            log_event(f"Error fetching file {file_code}: {e}")
+            bot.copy_message(message.chat.id, channel_id, msg_id, caption=f"📄 `{name}`\n🤖 via @{bot.get_me().username}")
+            db.add_download(code)
+        except Exception:
+            bot.reply_to(message, "⚠️ **Error:** content unavailable.")
+    
+    # ➤ NORMAL START
     else:
-        # Normal Welcome
-        bot.reply_to(message, 
-                     f"👋 Hi {message.from_user.first_name}!\n\n"
-                     "I am your personal File Store Bot.\n"
-                     "📤 **Send me any file** to store it.\n"
-                     "🔗 I will give you a shareable link.\n\n"
-                     "Use /myfiles to see your uploads.")
+        txt = (
+            f"👋 **Hello, {message.from_user.first_name}!**\n"
+            f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
+            f"☁️ **Advanced File Store Bot**\n\n"
+            f"🔹 Send me **any file** to store it.\n"
+            f"🔹 I will provide a **permanent link**.\n"
+            f"🔹 Create **Personal Channels** for storage.\n\n"
+            f"🚀 _Powered by Render & SQLite_"
+        )
+        bot.send_message(message.chat.id, txt, reply_markup=main_menu_keyboard(message.from_user.id))
+
+@bot.message_handler(commands=['help'])
+@check_user
+def help_command(message):
+    user_id = message.from_user.id
+    is_adm = user_id in ADMIN_LIST or user_id == OWNER_ID
+    
+    txt = "📚 **COMMAND LIST**\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\n"
+    txt += "👤 **User Commands:**\n"
+    txt += "• `/start` - Main Menu\n"
+    txt += "• `/myfiles` - View your files\n"
+    txt += "• `/connect_channel` - Link custom storage\n"
+    txt += "• `/disconnect` - Unlink channel\n\n"
+    
+    if is_adm:
+        txt += "🛡️ **Admin Commands:**\n"
+        txt += "• `/admin` - Open Admin Dashboard\n"
+        txt += "• `/stats` - Quick server stats\n"
+        txt += "• `/ban <id>` - Ban a user\n"
+    
+    bot.reply_to(message, txt)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 📤 FILE UPLOAD HANDLER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @bot.message_handler(content_types=['document', 'photo', 'video', 'audio'])
-@is_banned
-def file_handler(message):
-    """Handles user uploads"""
+@check_user
+def handle_file(message):
+    # 1. Get File Info
+    if message.document:
+        fid, unique, name, mime = message.document.file_id, message.document.file_unique_id, message.document.file_name, message.document.mime_type
+    elif message.video:
+        fid, unique, name, mime = message.video.file_id, message.video.file_unique_id, "video.mp4", "video/mp4"
+    elif message.audio:
+        fid, unique, name, mime = message.audio.file_id, message.audio.file_unique_id, "audio.mp3", "audio/mpeg"
+    elif message.photo:
+        fid, unique, name, mime = message.photo[-1].file_id, message.photo[-1].file_unique_id, "photo.jpg", "image/jpeg"
+    else: return
+
     user_id = message.from_user.id
     db.add_user(user_id)
     
-    file_type, file_id, unique_id, file_name, mime_type = get_file_type_and_id(message)
-    if not file_id:
-        bot.reply_to(message, "❌ File type not supported.")
-        return
-
-    status_msg = bot.reply_to(message, "🔄 Processing...")
-
-    # Determine Storage Channel (Personal or Main)
-    storage_target = db.get_user_channel(user_id) or BIN_CHANNEL
+    # 2. UI Feedback
+    status = bot.reply_to(message, "⚡ **Processing...**")
+    
+    # 3. Determine Storage Channel
+    storage_channel = db.get_channel(user_id) or BIN_CHANNEL
     
     try:
-        # Forward to storage channel
-        forwarded = bot.forward_message(storage_target, message.chat.id, message.message_id)
+        # 4. Forward to Storage
+        fwd = bot.forward_message(storage_channel, message.chat.id, message.message_id)
         
-        # Save Metadata
-        code = generate_safe_code()
-        db.add_file(code, file_name, mime_type, file_id, unique_id, forwarded.message_id, storage_target, user_id)
-        
+        # 5. Generate Data
+        code = generate_code()
         link = f"https://t.me/{bot.get_me().username}?start={code}"
         
-        bot.edit_message_text(
-            f"✅ **File Saved!**\n\n"
-            f"📂 Name: `{file_name}`\n"
-            f"🔗 Link: {link}",
-            chat_id=message.chat.id,
-            message_id=status_msg.message_id,
-            parse_mode="Markdown"
+        # 6. Save DB
+        db.add_file(code, name, mime, fid, unique, fwd.message_id, storage_channel, user_id)
+        
+        # 7. Success Response
+        res_text = (
+            f"✅ **File Saved Successfully!**\n"
+            f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
+            f"📂 **Name:** `{name}`\n"
+            f"🔐 **Code:** `{code}`\n\n"
+            f"🔗 **Share Link:**\n`{link}`"
         )
-        log_event(f"User {user_id} uploaded {file_name} ({code})")
+        
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔁 Share Link", url=f"https://t.me/share/url?url={link}"))
+        
+        bot.edit_message_text(res_text, message.chat.id, status.message_id, reply_markup=kb)
+        log(f"User {user_id} uploaded {code}")
         
     except Exception as e:
-        bot.edit_message_text(f"❌ Error saving file: {e}", message.chat.id, status_msg.message_id)
-        logger.error(f"Upload Error: {e}")
+        bot.edit_message_text(f"❌ **Error:** {e}", message.chat.id, status.message_id)
 
-@bot.message_handler(commands=['myfiles'])
-@is_banned
-def myfiles_handler(message):
-    """Simple pagination for user files"""
-    files = db.get_user_files(message.from_user.id, limit=20)
-    if not files:
-        bot.reply_to(message, "You haven't uploaded any files yet.")
-        return
-    
-    text = "📂 **Your Recent Files:**\n\n"
-    for f in files:
-        # f: code, name, downloads
-        text += f"🔹 `{f[1]}`\n   └ 🔗 `/start {f[0]}` | 📥 {f[2]}\n\n"
-    
-    bot.reply_to(message, text, parse_mode="Markdown")
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 👥 USER CHANNEL MANAGEMENT
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @bot.message_handler(commands=['connect_channel'])
-@is_banned
-def connect_channel(message):
-    bot.reply_to(message, "Forward a message from your channel to connect it. I must be an Admin there!")
-    bot.register_next_step_handler(message, process_channel_connect)
+@check_user
+def connect_req(message):
+    msg = bot.reply_to(message, "👉 **Forward a message** from your channel here.\n\n⚠️ I must be an **Admin** in that channel!")
+    bot.register_next_step_handler(msg, process_channel_link)
 
-def process_channel_connect(message):
-    if not message.forward_from_chat:
-        bot.reply_to(message, "❌ That is not a forwarded channel message.")
-        return
-    
-    channel_id = message.forward_from_chat.id
-    title = message.forward_from_chat.title
-    user_id = message.from_user.id
-    
+def process_channel_link(message):
     try:
-        # Verify Admin Rights
-        chat_member = bot.get_chat_member(channel_id, bot.get_me().id)
-        if chat_member.status not in ['administrator', 'creator']:
-            bot.reply_to(message, "❌ I am not an admin in that channel.")
+        if not message.forward_from_chat:
+            bot.reply_to(message, "❌ Not a forwarded channel message.")
+            return
+        
+        cid = message.forward_from_chat.id
+        title = message.forward_from_chat.title
+        
+        # Check permissions
+        mem = bot.get_chat_member(cid, bot.get_me().id)
+        if mem.status not in ['administrator', 'creator']:
+            bot.reply_to(message, "❌ **I am not an admin there.** Promte me first!")
             return
             
-        db.set_user_channel(user_id, channel_id, title)
-        bot.reply_to(message, f"✅ Successfully connected to **{title}**.\nFuture uploads will go there.")
-        log_event(f"User {user_id} connected channel {channel_id}")
+        db.set_channel(message.from_user.id, cid, title)
+        bot.reply_to(message, f"✅ **Connected!**\nChannel: `{title}`\nID: `{cid}`\n\nFuture files will be stored here.")
     except Exception as e:
         bot.reply_to(message, f"❌ Error: {e}")
 
-# ---------------------------------------------------------
-# ADMIN & OWNER PANEL
-# ---------------------------------------------------------
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🛡️ ADMIN PANEL LOGIC
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@bot.message_handler(commands=['admin', 'stats'])
+@bot.message_handler(commands=['admin'])
 @is_admin
-def admin_panel(message):
-    u, f, b = db.get_stats()
-    
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
-        types.InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban"),
-        types.InlineKeyboardButton("🔓 Unban User", callback_data="admin_unban"),
-        types.InlineKeyboardButton("🗑 Delete File", callback_data="admin_del")
-    )
-    
-    bot.reply_to(message, 
-                 f"🛡 **Admin Panel**\n\n"
-                 f"👤 Users: `{u}`\n"
-                 f"📂 Files: `{f}`\n"
-                 f"🚫 Banned: `{b}`",
-                 reply_markup=markup, parse_mode="Markdown")
+def admin_dash(message):
+    bot.reply_to(message, "🛡️ **Control Panel**", reply_markup=admin_keyboard())
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
-def admin_callback(call):
-    if call.from_user.id not in ADMIN_LIST and call.from_user.id != OWNER_ID:
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    uid = call.from_user.id
+    
+    # ➤ USER CALLBACKS
+    if call.data == "help_menu":
+        bot.answer_callback_query(call.id)
+        help_command(call.message)
+        return
+        
+    if call.data == "my_files":
+        cnt = db.get_user_files_stats(uid)
+        bot.answer_callback_query(call.id, f"You have {cnt} files stored.")
+        return
+        
+    if call.data == "home":
+        bot.edit_message_text(f"☁️ **Advanced File Store**\nSelect an option:", call.message.chat.id, call.message.message_id, reply_markup=main_menu_keyboard(uid))
         return
 
-    if call.data == "admin_broadcast":
-        msg = bot.send_message(call.message.chat.id, "Send the message you want to broadcast (Text, Photo, etc).")
+    # ➤ ADMIN CALLBACKS (Security Check)
+    if uid not in ADMIN_LIST and uid != OWNER_ID:
+        bot.answer_callback_query(call.id, "🚫 Admin only!", show_alert=True)
+        return
+
+    if call.data == "admin_panel":
+        bot.edit_message_text("🛡️ **Admin Dashboard**", call.message.chat.id, call.message.message_id, reply_markup=admin_keyboard())
+
+    elif call.data == "adm_stats":
+        u, f, b = db.get_system_stats()
+        txt = (
+            f"📊 **Live Statistics**\n"
+            f"▬▬▬▬▬▬▬▬▬▬▬▬\n"
+            f"👥 **Users:** `{u}`\n"
+            f"📂 **Files:** `{f}`\n"
+            f"🚫 **Banned:** `{b}`\n"
+            f"💾 **DB Size:** Optimized"
+        )
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=admin_keyboard())
+
+    elif call.data == "adm_maint_toggle":
+        curr = db.get_setting("maintenance_mode")
+        new_val = "0" if curr == "1" else "1"
+        db.set_setting("maintenance_mode", new_val)
+        status = "🔴 ON" if new_val == "1" else "🟢 OFF"
+        bot.answer_callback_query(call.id, f"Maintenance Mode: {status}")
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=admin_keyboard())
+
+    elif call.data == "adm_broadcast":
+        msg = bot.send_message(call.message.chat.id, "📢 **Send the message to broadcast:**\n(Text, Photo, Video supported)")
         bot.register_next_step_handler(msg, start_broadcast)
-    
-    elif call.data == "admin_ban":
-        msg = bot.send_message(call.message.chat.id, "Send User ID to Ban:")
-        bot.register_next_step_handler(msg, lambda m: toggle_ban(m, 1))
-        
-    elif call.data == "admin_unban":
-        msg = bot.send_message(call.message.chat.id, "Send User ID to Unban:")
-        bot.register_next_step_handler(msg, lambda m: toggle_ban(m, 0))
-        
-    elif call.data == "admin_del":
-        msg = bot.send_message(call.message.chat.id, "Send File Code to Delete:")
-        bot.register_next_step_handler(msg, delete_file_admin)
 
-def toggle_ban(message, status):
-    try:
-        uid = int(message.text)
-        db.set_ban_status(uid, status)
-        bot.reply_to(message, f"User {uid} {'Banned' if status else 'Unbanned'}.")
-        log_event(f"Admin {message.from_user.id} set ban={status} for {uid}")
-    except:
-        bot.reply_to(message, "Invalid ID.")
+    elif call.data == "adm_del":
+        msg = bot.send_message(call.message.chat.id, "🗑 **Send File Code to delete:**")
+        bot.register_next_step_handler(msg, lambda m: admin_delete_logic(m))
 
-def delete_file_admin(message):
-    code = message.text.strip()
-    db.delete_file(code)
-    bot.reply_to(message, f"File {code} removed from DB (Message in channel remains).")
-    log_event(f"Admin {message.from_user.id} deleted file {code}")
-
-# ---------------------------------------------------------
-# BROADCAST SYSTEM (Memory Efficient)
-# ---------------------------------------------------------
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ⚙️ BACKGROUND TASKS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def start_broadcast(message):
-    # Run in a separate thread to not block the bot
-    threading.Thread(target=run_broadcast, args=(message,)).start()
+    threading.Thread(target=run_broadcast_process, args=(message,)).start()
 
-def run_broadcast(message_to_copy):
-    """
-    Sequentially sends messages to avoid hitting RAM limits or Telegram limits.
-    """
-    admin_id = message_to_copy.from_user.id
-    bot.send_message(admin_id, "🚀 Broadcast started...")
+def run_broadcast_process(msg):
+    admin_id = msg.from_user.id
+    bot.send_message(admin_id, "🚀 **Broadcast Started...**")
     
-    users = db.get_all_users_generator() # Generator
-    count = 0
-    errors = 0
+    users = db.get_all_users()
+    sent, failed = 0, 0
+    start = time.time()
     
-    start_time = time.time()
-    
-    # Save broadcast to Log Channel for archive
-    try:
-        bot.copy_message(LOG_CHANNEL, message_to_copy.chat.id, message_to_copy.message_id)
-    except: pass
-
-    for user_id in users:
+    for uid in users:
         try:
-            bot.copy_message(user_id, message_to_copy.chat.id, message_to_copy.message_id)
-            count += 1
-        except Exception as e:
-            errors += 1
-            # If blocked, maybe mark as inactive in future versions
-            pass
-        
-        # Rate Limiting: 20 messages per second is global limit, let's be safe
-        if count % 20 == 0:
-            time.sleep(1) 
+            bot.copy_message(uid, msg.chat.id, msg.message_id)
+            sent += 1
+            time.sleep(0.05) # Rate limit safety
+        except:
+            failed += 1
             
-    elapsed = time.time() - start_time
     bot.send_message(admin_id, 
-                     f"✅ **Broadcast Complete**\n\n"
-                     f"👥 Sent: {count}\n"
-                     f"❌ Failed: {errors}\n"
-                     f"⏱ Time: {elapsed:.2f}s", parse_mode="Markdown")
+        f"✅ **Broadcast Finished**\n"
+        f"▬▬▬▬▬▬▬▬▬▬▬▬\n"
+        f"👥 Sent: `{sent}`\n"
+        f"❌ Failed: `{failed}`\n"
+        f"⏱ Time: `{round(time.time()-start, 2)}s`"
+    )
 
-# ---------------------------------------------------------
-# ENTRY POINT
-# ---------------------------------------------------------
+def admin_delete_logic(message):
+    code = message.text.strip()
+    db.delete_file(code)
+    bot.reply_to(message, f"🗑 File `{code}` removed from Database.")
 
-def main():
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🌐 WEBSERVER KEEP-ALIVE (For Render)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def keep_alive():
+    """Dummy server to satisfy Render Port check"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(('0.0.0.0', int(os.environ.get("PORT", 8080))))
+        sock.listen(1)
+        print("✅ Dummy Server Listening on Port 8080")
+    except Exception as e:
+        print(f"⚠️ Server Bind Error: {e}")
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 🚀 MAIN LOOP
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if __name__ == "__main__":
     if not BOT_TOKEN or not BIN_CHANNEL:
-        print("❌ Error: BOT_TOKEN and BIN_CHANNEL env vars are required.")
-        sys.exit(1)
-        
-    print("🚀 Bot Started on Render...")
-    log_event("🤖 Bot System Restarted / Online")
+        print("❌ CRITICAL: BOT_TOKEN or BIN_CHANNEL missing.")
+        sys.exit()
+
+    print("🔥 Bot 2.0 Starting...")
     
-    # Infinite polling with auto-restart on network error
+    # Start Dummy Server for Render
+    threading.Thread(target=keep_alive, daemon=True).start()
+
     while True:
         try:
             bot.infinity_polling(timeout=10, long_polling_timeout=5)
         except Exception as e:
-            print(f"⚠️ Bot crashed: {e}")
-            time.sleep(5) # Wait before retry
-
-if __name__ == '__main__':
-    main()
+            print(f"⚠️ Polling Error: {e}")
+            time.sleep(5)
